@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width">
+<title>Brainfuck v2.0 &mdash; Blog</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/normalize/8.0.1/normalize.min.css" integrity="sha512-NhSC1YmyruXifcj/KFRWoC561YpHpc5Jtzgvbuzx5VozKpWvQ+4nXhPdFgmx8xqexRcpAglTj9sIBWINXa8x5w==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+<link rel="stylesheet" href="../../../static/dark.css" type="text/css">
+<link rel="stylesheet" href="../../../static/pygments.css" type="text/css">
+<link rel="shortcut icon" href="../../../static/icon.ico" />
+<script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+<header><span>January 10, 2025</span></header>
+<article>
+<h1>Brainfuck v2.0</h1>
+
+<p>Last time, we implemented a simple Brainfuck interpreter in a naive way. We defined a data pointer, instruction pointer, and some memory and simply stepped through each instruction. But we can do better. Let&#39;s tackle two simple optimizations. First, we compress blocks of identical instructions, such that &#39;+++++&#39; becomes &#39;+5&#39;. This works for the +, -, &gt;, and &lt; instructions. The second optimization, will be to precompute the matching pairs of jump instructions. This way, when we encounter a &#39;[&#39;, we don&#39;t have to iterate our way all through the program to find the matching &#39;]&#39;, but can instantly jump there using a pre-computed memory address.</p>
+
+<p>What we are really doing is converting our program into an intermediate representation. Instead of a bare character, we want to define some sort of Token data type that holds more information. For what I&#39;m calling our &#39;MathTokens&#39; (i.e., +, -, &gt;, &lt;), we want to hold a size field. For our jump tokens, we want to hold a desitnation address. And our I/O tokens, we don&#39;t need any extra information. First, let&#39;s define an enum TokenType to designate the eight different types of token:</p>
+<div class="highlight"><pre><span></span><span class="kd">enum</span> <span class="nc">TokenType</span> <span class="p">{</span>
+    <span class="k">case</span> <span class="n">Add</span>
+    <span class="k">case</span> <span class="n">Subtract</span>
+    <span class="k">case</span> <span class="n">Inc</span>
+    <span class="k">case</span> <span class="n">Dec</span>
+    <span class="k">case</span> <span class="n">JumpIfZero</span>
+    <span class="k">case</span> <span class="n">JumpIfNotZero</span>
+    <span class="k">case</span> <span class="n">Output</span>
+    <span class="k">case</span> <span class="n">Input</span>
+<span class="p">}</span>
+</pre></div>
+
+<p>We&#39;ll also find it useful to map the actual string characters to their corresponding token types:
+<code>swift
+let tokenMap: [Character: TokenType] = [
+    &quot;+&quot;: .Add, &quot;-&quot;: .Subtract, &quot;&lt;&quot;: .Dec, &quot;&gt;&quot;: .Inc,
+    &quot;[&quot;: .JumpIfZero, &quot;]&quot;: .JumpIfNotZero,
+    &quot;.&quot;: .Output, &quot;,&quot;: .Input
+]
+</code></p>
+
+<p>Now we could just declare one sort of Token struct and make the size and destination properties optionals. But let&#39;s have some fun with Swift&#39;s type system and overengineer things a bit. I&#39;m going to define a protocol. Swift protocols are a bit like abstract classes. They define some set of fields or methods that an object which conforms to that protocol is guaranteed to have.</p>
+<div class="highlight"><pre><span></span><span class="kd">protocol</span> <span class="nc">BFToken</span> <span class="p">{</span>
+    <span class="kd">var</span> <span class="nv">type</span><span class="p">:</span> <span class="n">TokenType</span> <span class="p">{</span> <span class="kr">get</span> <span class="kr">set</span> <span class="p">}</span>
+    <span class="kd">var</span> <span class="nv">line</span><span class="p">:</span> <span class="nb">Int</span> <span class="p">{</span> <span class="kr">get</span> <span class="kr">set</span> <span class="p">}</span>
+    <span class="kd">var</span> <span class="nv">lexeme</span><span class="p">:</span> <span class="nb">String</span> <span class="p">{</span><span class="kr">get</span> <span class="kr">set</span> <span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+
+<p>Here we are saying that any BFToken object must have a type, a line number, and a lexeme (the original program string that generated this token). Those last two might be helpful for debugging. So we can define three different types of token that conform to this protocol:</p>
+<div class="highlight"><pre><span></span><span class="kd">struct</span> <span class="nc">MathToken</span><span class="p">:</span> <span class="n">BFToken</span> <span class="p">{</span>
+    <span class="kd">var</span> <span class="nv">type</span><span class="p">:</span> <span class="n">TokenType</span>
+    <span class="kd">var</span> <span class="nv">size</span><span class="p">:</span> <span class="nb">Int</span>
+    <span class="kd">var</span> <span class="nv">line</span><span class="p">:</span> <span class="nb">Int</span>
+    <span class="kd">var</span> <span class="nv">lexeme</span><span class="p">:</span> <span class="nb">String</span>
+<span class="p">}</span>
+
+<span class="kd">struct</span> <span class="nc">JumpToken</span><span class="p">:</span><span class="n">BFToken</span> <span class="p">{</span>
+    <span class="kd">var</span> <span class="nv">type</span><span class="p">:</span> <span class="n">TokenType</span>
+    <span class="kd">var</span> <span class="nv">destination</span><span class="p">:</span> <span class="nb">Int</span>
+    <span class="kd">var</span> <span class="nv">line</span><span class="p">:</span> <span class="nb">Int</span>
+    <span class="kd">var</span> <span class="nv">lexeme</span><span class="p">:</span> <span class="nb">String</span>
+<span class="p">}</span>
+<span class="kd">struct</span> <span class="nc">IOToken</span><span class="p">:</span><span class="n">BFToken</span> <span class="p">{</span>
+    <span class="kd">var</span> <span class="nv">type</span><span class="p">:</span> <span class="n">TokenType</span>
+    <span class="kd">var</span> <span class="nv">line</span><span class="p">:</span> <span class="nb">Int</span>
+    <span class="kd">var</span> <span class="nv">lexeme</span><span class="p">:</span> <span class="nb">String</span>
+<span class="p">}</span>
+</pre></div>
+
+<p>Now that we have our data types, we can implement the first pass of our lexer/tokenizer.</p>
+<div class="highlight"><pre><span></span><span class="kd">var</span> <span class="nv">line</span> <span class="p">=</span> <span class="mi">1</span>
+<span class="kd">var</span> <span class="nv">idx</span> <span class="p">=</span> <span class="mi">0</span>
+<span class="kd">var</span> <span class="nv">tokenList</span><span class="p">:</span> <span class="p">[</span><span class="n">BFToken</span><span class="p">]</span> <span class="p">=</span> <span class="p">[]</span>
+</pre></div>
+
+<p>Note the type of tokenList. It can hold any time that conforms to the BFToken protocol. Neat!</p>
+<div class="highlight"><pre><span></span><span class="k">while</span> <span class="n">idx</span> <span class="o">&lt;</span> <span class="n">program</span><span class="p">.</span><span class="bp">count</span> <span class="p">{</span>
+    <span class="kd">let</span> <span class="nv">cur</span> <span class="p">=</span> <span class="n">program</span><span class="p">.</span><span class="n">index</span><span class="p">(</span><span class="n">program</span><span class="p">.</span><span class="n">startIndex</span><span class="p">,</span> <span class="n">offsetBy</span><span class="p">:</span> <span class="n">idx</span><span class="p">)</span> <span class="c1">// Swift uses a separate string index type!</span>
+    
+    <span class="k">switch</span> <span class="n">progra</span><span class="p">[</span><span class="n">cur</span><span class="p">]</span> <span class="p">{</span>
+    <span class="k">case</span> <span class="s">&quot;+&quot;</span><span class="p">,</span> <span class="s">&quot;-&quot;</span><span class="p">,</span> <span class="s">&quot;&gt;&quot;</span><span class="p">,</span> <span class="s">&quot;&lt;&quot;</span><span class="p">:</span>
+        <span class="kd">var</span> <span class="nv">count</span> <span class="p">=</span> <span class="mi">1</span>
+        <span class="kd">var</span> <span class="nv">new_idx</span> <span class="p">=</span> <span class="n">idx</span> <span class="o">+</span> <span class="mi">1</span>
+        <span class="kd">var</span> <span class="nv">new_cur</span> <span class="p">=</span> <span class="n">program</span><span class="p">.</span><span class="n">index</span><span class="p">(</span><span class="n">program</span><span class="p">.</span><span class="n">startIndex</span><span class="p">,</span> <span class="n">offsetBy</span><span class="p">:</span> <span class="n">new_idx</span><span class="p">)</span>
+        <span class="kd">let</span> <span class="nv">stopSymbols</span> <span class="p">=</span> <span class="n">Set</span><span class="p">(</span><span class="s">&quot;+-&gt;&lt;][.,]&quot;</span><span class="p">).</span><span class="n">subtracting</span><span class="p">([</span><span class="n">program</span><span class="p">[</span><span class="n">cur</span><span class="p">]])</span>
+        
+        <span class="k">while</span> <span class="n">new_idx</span> <span class="o">&lt;</span> <span class="n">program</span><span class="p">.</span><span class="bp">count</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">stopSymbols</span><span class="p">.</span><span class="bp">contains</span><span class="p">(</span><span class="n">program</span><span class="p">[</span><span class="n">new_cur</span><span class="p">])</span> <span class="p">{</span>
+            <span class="k">if</span> <span class="n">program</span><span class="p">[</span><span class="n">new_cur</span><span class="p">]</span> <span class="p">==</span> <span class="s">&quot;</span><span class="se">\n</span><span class="s">&quot;</span> <span class="p">{</span> <span class="n">line</span> <span class="o">+=</span> <span class="mi">1</span> <span class="p">}</span>
+            <span class="k">if</span> <span class="p">(</span><span class="n">program</span><span class="p">[</span><span class="n">new_cur</span><span class="p">]</span> <span class="p">==</span> <span class="n">program</span><span class="p">[</span><span class="n">cur</span><span class="p">]</span> <span class="p">{</span> <span class="bp">count</span> <span class="o">+=</span> <span class="mi">1</span> <span class="p">})</span>
+            <span class="n">new_idx</span> <span class="o">+=</span> <span class="mi">1</span>
+            <span class="n">new_cur</span> <span class="p">=</span> <span class="n">program</span><span class="p">.</span><span class="n">index</span><span class="p">(</span><span class="n">program</span><span class="p">.</span><span class="n">startIndex</span><span class="p">,</span> <span class="n">offsetBy</span><span class="p">:</span> <span class="n">new_idx</span><span class="p">)</span>
+        <span class="p">}</span>
+        
+        <span class="n">tokenList</span><span class="p">.</span><span class="n">append</span><span class="p">(</span><span class="n">MathToken</span><span class="p">(</span>
+                                <span class="n">type</span><span class="p">:</span> <span class="n">tokenMap</span><span class="p">[</span><span class="n">program</span><span class="p">[</span><span class="n">cur</span><span class="p">]]</span><span class="o">!</span><span class="p">,</span>
+                                <span class="n">size</span><span class="p">:</span> <span class="bp">count</span><span class="p">,</span>
+                                <span class="n">line</span><span class="p">:</span> <span class="n">line</span>
+                                <span class="n">lexeme</span><span class="p">:</span> <span class="n">program</span><span class="p">.</span><span class="n">substring</span><span class="p">(</span><span class="n">from</span><span class="p">:</span> <span class="n">idx</span><span class="p">,</span> <span class="n">to</span><span class="p">:</span> <span class="n">new_idx</span><span class="p">)))</span>
+        <span class="n">idx</span> <span class="p">=</span> <span class="n">new_idx</span>
+</pre></div>
+
+<p>This first case in our switch block is doing a few things. First, Swift lets us match against several cases at once, so we check for a math token. Then, we need to see how long the run of identical tokens is, so we define a new idx and increment it until we run into a stop symbol (i.e., a different Brainfuck instruction). We want to continue moving and ignore any non-Brainfuck characters, which we treat as comments. This way, a block of BF code like 
+<code>
++++ comment
+++-
+</code>
+Will get tokenized into a +5 token and a -1 token. Once we find the end of the block, we add a MathToken to our tokenList. Handling the other symbols is pretty simple:
+<code>swift
+    case &quot;[&quot;, &quot;]&quot;:
+        tokenList.append(JumpToken(
+                                type: tokenMap[program[cur]]!,
+                                destination: -1,
+                                line: line,
+                                lexeme: String(program[cur])))
+        idx += 1
+    case &quot;,&quot;, &quot;.&quot;:
+        tokenList.append(IOToken(
+                                type: tokenMap[program[cur]]!,
+                                line: line,
+                                lexeme: String(program[cur])))
+        idx += 1
+    case &quot;\n&quot;:
+        idx += 1
+        line += 1
+    default:
+        idx += 1
+    }
+}
+</code>
+And that&#39;s our first pass. We now have a list of BF tokens. However, we just filled in -1 for the destination of each JumpToken as a placeholder. Now we have to fix that in our second pass. Finding matching pairs of brackets is a classic CS problem. We scan through our list and every time we find an open bracket, we push the index onto a stack. When we find a closing bracket, we pop from the stack. If we try to pop from an empty stack, or if we are left with a non-empty stack at the end, we know there&#39;s a mismatched bracket somewhere and we can throw an error.</p>
+<div class="highlight"><pre><span></span><span class="kd">var</span> <span class="nv">stack</span><span class="p">:</span> <span class="p">[</span><span class="nb">Int</span><span class="p">]</span> <span class="p">=</span> <span class="p">[]</span>
+<span class="k">for</span> <span class="p">(</span><span class="n">idx</span><span class="p">,</span> <span class="n">token</span><span class="p">)</span> <span class="k">in</span> <span class="n">tokenList</span><span class="p">.</span><span class="n">enumerated</span><span class="p">()</span> <span class="p">{</span>
+    <span class="k">if</span> <span class="n">token</span><span class="p">.</span><span class="n">type</span> <span class="p">==</span> <span class="p">.</span><span class="n">JumpIfZero</span> <span class="p">{</span> <span class="c1">//Open bracket</span>
+        <span class="n">stack</span><span class="p">.</span><span class="n">append</span><span class="p">(</span><span class="n">idx</span><span class="p">)</span>
+    <span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="n">token</span><span class="p">.</span><span class="n">type</span> <span class="p">==</span> <span class="p">.</span><span class="n">JumpIfNotZero</span> <span class="p">{</span>
+        <span class="kd">let</span> <span class="nv">match</span> <span class="p">=</span> <span class="n">stack</span><span class="p">.</span><span class="n">popLast</span><span class="p">()</span> <span class="p">{</span>
+            <span class="kd">var</span> <span class="nv">closer</span> <span class="p">=</span> <span class="n">tokenList</span><span class="p">[</span><span class="n">match</span><span class="p">]</span> <span class="k">as</span><span class="p">!</span> <span class="n">JumpToken</span>
+            <span class="kd">var</span> <span class="nv">opener</span> <span class="p">=</span> <span class="n">tokenList</span><span class="p">[</span><span class="n">idx</span><span class="p">]</span> <span class="k">as</span><span class="p">!</span> <span class="n">JumpToken</span>
+            <span class="n">closer</span><span class="p">.</span><span class="n">destination</span> <span class="p">=</span> <span class="n">idx</span>
+            <span class="n">opener</span><span class="p">.</span><span class="n">destination</span> <span class="p">=</span> <span class="n">match</span>
+            <span class="n">tokenList</span><span class="p">[</span><span class="n">match</span><span class="p">]</span> <span class="p">=</span> <span class="n">closer</span>
+            <span class="n">tokenList</span><span class="p">[</span><span class="n">idx</span><span class="p">]</span> <span class="p">=</span> <span class="n">opener</span>
+        <span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+            <span class="bp">fatalError</span><span class="p">(</span><span class="s">&quot;Unmatched bracket at line </span><span class="si">\(</span><span class="n">token</span><span class="p">.</span><span class="n">line</span><span class="si">)</span><span class="s">&quot;</span><span class="p">)</span>
+        <span class="p">}</span>
+    <span class="p">}</span>
+<span class="p">}</span>
+<span class="k">if</span> <span class="o">!</span><span class="n">stack</span><span class="p">.</span><span class="bp">isEmpty</span> <span class="p">{</span>
+    <span class="bp">fatalError</span><span class="p">(</span><span class="s">&quot;Unmatched brackets left over from line </span><span class="si">\(</span><span class="n">tokenList</span><span class="p">[</span><span class="n">stack</span><span class="p">[</span><span class="mi">0</span><span class="p">]].</span><span class="n">line</span><span class="si">)</span><span class="s">&quot;</span><span class="p">)</span>
+    
+<span class="p">}</span>
+</pre></div>
+
+<p>I&#39;m doing a little dancing around the type system here. Because <code>tokenList</code> only knows that each element is some kind of BFToken, I&#39;m explicitly casting to JumpToken so we can modify the destination value. I&#39;m sure there is a more idiomatic way to do this, but I haven&#39;t found it yet. If we find unmatched brackets, we throw an error and let the user know which line we found them at.</p>
+
+<p>So that&#39;s two passes to convert a string of tokens into a more useful intermediate representation. I wouldn&#39;t quite call it an abstract syntax tree, but we&#39;re doing something similar, if much simpler. Now we can interpret this list of tokens and save ourselves a lot of iterating over our program string. After we set up our instructionPointer, dataPointer, memory, and output buffer jsut the same as last time, we can write a new interpret loop with more of that sweet, sweet pattern matching:</p>
+<div class="highlight"><pre><span></span><span class="k">while</span> <span class="n">instructionPointer</span> <span class="o">&lt;</span> <span class="n">tokenList</span><span class="p">.</span><span class="bp">count</span> <span class="p">{</span>
+    <span class="k">switch</span> <span class="n">tokenList</span><span class="p">[</span><span class="n">instructionPointer</span><span class="p">]</span> <span class="p">{</span>
+    <span class="k">case</span> <span class="kd">let</span> <span class="nv">token</span> <span class="k">as</span> <span class="n">MathToken</span><span class="p">:</span>
+        <span class="k">switch</span> <span class="n">token</span><span class="p">.</span><span class="n">type</span> <span class="p">{</span>
+        <span class="k">case</span> <span class="p">.</span><span class="n">Add</span><span class="p">:</span> <span class="n">memory</span><span class="p">[</span><span class="n">dataPointer</span><span class="p">]</span> <span class="o">+=</span> <span class="n">token</span><span class="p">.</span><span class="n">size</span>
+        <span class="k">case</span> <span class="p">.</span><span class="n">Subtract</span><span class="p">:</span> <span class="n">memory</span><span class="p">[</span><span class="n">dataPointer</span><span class="p">]</span> <span class="o">-=</span> <span class="n">token</span><span class="p">.</span><span class="n">size</span>
+        <span class="k">case</span> <span class="p">.</span><span class="n">Inc</span><span class="p">:</span> <span class="n">dataPointer</span> <span class="p">=</span> <span class="p">(</span><span class="n">dataPointer</span> <span class="o">+</span> <span class="n">token</span><span class="p">.</span><span class="n">size</span><span class="p">)</span> <span class="c1">//% MAX_MEM</span>
+        <span class="k">case</span> <span class="p">.</span><span class="n">Dec</span><span class="p">:</span> <span class="n">dataPointer</span> <span class="o">-=</span> <span class="n">token</span><span class="p">.</span><span class="n">size</span>
+        <span class="k">default</span><span class="p">:</span> <span class="k">break</span>
+        <span class="p">}</span>
+        <span class="n">instructionPointer</span> <span class="o">+=</span> <span class="mi">1</span>
+    <span class="k">case</span> <span class="kd">let</span> <span class="nv">token</span> <span class="k">as</span> <span class="n">IOToken</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">token</span><span class="p">.</span><span class="n">type</span> <span class="p">==</span> <span class="p">.</span><span class="n">Input</span> <span class="p">{</span>
+            <span class="n">memory</span><span class="p">[</span><span class="n">dataPointer</span><span class="p">]</span> <span class="p">=</span> <span class="nb">Int</span><span class="p">(</span><span class="n">getchar</span><span class="p">())</span>
+        <span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="n">token</span><span class="p">.</span><span class="n">type</span> <span class="p">==</span> <span class="p">.</span><span class="n">Output</span> <span class="p">{</span>
+            <span class="n">output</span><span class="p">.</span><span class="n">append</span><span class="p">(</span><span class="n">memory</span><span class="p">[</span><span class="n">dataPointer</span><span class="p">])</span>
+        <span class="p">}</span>
+        <span class="n">instructionPointer</span> <span class="o">+=</span> <span class="mi">1</span>
+     <span class="k">case</span> <span class="kd">let</span> <span class="nv">token</span> <span class="k">as</span> <span class="n">JumpToken</span><span class="p">:</span>
+         <span class="k">if</span> <span class="n">token</span><span class="p">.</span><span class="n">type</span> <span class="p">==</span> <span class="p">.</span><span class="n">JumpIfZero</span> <span class="o">&amp;&amp;</span> <span class="n">memory</span><span class="p">[</span><span class="n">dataPointer</span><span class="p">]</span> <span class="p">==</span> <span class="mi">0</span> <span class="p">{</span>
+             <span class="n">instructionPointer</span> <span class="p">=</span> <span class="n">token</span><span class="p">.</span><span class="n">destination</span>
+         <span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="n">token</span><span class="p">.</span><span class="n">type</span> <span class="p">==</span> <span class="p">.</span><span class="n">JumpIfNotZero</span> <span class="o">&amp;&amp;</span> <span class="n">memory</span><span class="p">[</span><span class="n">dataPointer</span><span class="p">]</span> <span class="o">!=</span> <span class="mi">0</span> <span class="p">{</span>
+             <span class="n">instructionPointer</span> <span class="p">=</span> <span class="n">token</span><span class="p">.</span><span class="n">destination</span>
+         <span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+             <span class="n">instructionPointer</span> <span class="o">+=</span> <span class="mi">1</span>
+         <span class="p">}</span>
+         <span class="k">default</span><span class="p">:</span>
+             <span class="k">break</span>
+    <span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+
+<p>This time, the <code>case let token as MathToken</code> not only looks like a token of type MathToken, but does the cast for us, so we can treat <code>token</code> as a <code>MathToken</code> and access the size field without explicit casting. Much cleaner.  Anyway, that&#39;s our v2.0 interpreter! You can find the code on my github <a href="https://github.com/erk52/Brainf-ckery/blob/main/Brainfuckerv2.swift">here</a>, where I&#39;ve moved both passes and the interpret loop into a class (because I am infected with the OOP mind virus).</p>
+
+<p>One final post script. Up there, I used a string method <code>subtring(from: Int, to:Int)</code> which you won&#39;t find in Swift. I added it as an extension to the String class because messing around with startIndex and the special string index type every time I wanted a substring was annoying, especially when I was doing Advent of Code. I find it pretty useful, though I suppose it would be inefficient at scale. It&#39;s also a good excuse to show off extensions in Swift:</p>
+<div class="highlight"><pre><span></span><span class="kd">extension</span> <span class="nc">String</span> <span class="p">{</span>
+    <span class="kd">func</span> <span class="nf">substring</span><span class="p">(</span><span class="n">from</span><span class="p">:</span> <span class="nb">Int</span><span class="p">,</span> <span class="n">to</span><span class="p">:</span> <span class="nb">Int</span><span class="p">)</span> <span class="p">-&gt;</span> <span class="nb">String</span> <span class="p">{</span>
+        <span class="kd">let</span> <span class="nv">start</span> <span class="p">=</span> <span class="kc">self</span><span class="p">.</span><span class="n">index</span><span class="p">(</span><span class="kc">self</span><span class="p">.</span><span class="n">startIndex</span><span class="p">,</span> <span class="n">offsetBy</span><span class="p">:</span> <span class="n">from</span><span class="p">)</span>
+        <span class="kd">let</span> <span class="nv">end</span> <span class="p">=</span> <span class="kc">self</span><span class="p">.</span><span class="n">index</span><span class="p">(</span><span class="kc">self</span><span class="p">.</span><span class="n">startIndex</span><span class="p">,</span> <span class="n">offsetBy</span><span class="p">:</span> <span class="n">to</span><span class="p">)</span>
+        <span class="k">return</span> <span class="nb">String</span><span class="p">(</span><span class="kc">self</span><span class="p">[</span><span class="n">start</span><span class="p">..&lt;</span><span class="n">end</span><span class="p">])</span>
+    <span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+
+<p>Where do we go from here? I haven&#39;t quite decided yet. Maybe we&#39;ll try to compile to assembly from our intermediate representation. Making a just-in-time compiler might be beyond my expertise for now, but compiling to asm or even llvm IR might be fun. Stay tuned!</p>
+
+</article>
+<nav>
+
+<div id="prev"><span>« <a href="../../../2025/01/08/brainfuck-part-1.html">Brainfuck Part 1</a></span></div>
+
+
+</nav>
+<footer><span>By erk529 | <a href="../../../rss.xml">Subscribe</a> | <a href="../../../index.html">Index</a></span></footer>
+<script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: true });
+</script>
+</body>
+</html>
